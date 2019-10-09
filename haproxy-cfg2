@@ -1,0 +1,155 @@
+global
+    daemon
+    nbthread 4
+    cpu-map auto:1/1-4 0-3
+    stats socket /var/run/haproxy-stats.sock level admin expose-fd listeners
+    maxconn 2000
+    hard-stop-after 300s
+    log localhost:514 format rfc5424 local0
+    log-tag ingress
+    lua-load /usr/local/etc/haproxy/lua/send-response.lua
+    lua-load /usr/local/etc/haproxy/lua/auth-request.lua
+    tune.ssl.default-dh-param 2048
+    ssl-default-bind-ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-DSS-AES128-GCM-SHA256:kEDH+AESGCM:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA256:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA:DHE-RSA-AES256-SHA:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!3DES:!MD5:!PSK
+    ssl-default-bind-options no-sslv3 no-tls-tickets
+
+defaults
+    log global
+    maxconn 2000
+    option redispatch
+    option dontlognull
+    option http-server-close
+    option http-keep-alive
+    timeout http-request    300s
+    timeout connect         30s
+    timeout client          300s
+    timeout client-fin      50s
+    timeout queue           300s
+    timeout server          50s
+    timeout server-fin      50s
+    timeout tunnel          1h
+    timeout http-keep-alive 2m
+
+######
+###### Backends
+######
+backend default-cpronginx-svc-443
+    mode tcp
+    balance roundrobin
+    server 10.244.4.213:443 10.244.4.213:443 weight 1 maxconn 65536 check inter 30s
+    server 10.244.6.227:443 10.244.6.227:443 weight 1 maxconn 65536 check inter 30s
+    server 10.244.7.217:443 10.244.7.217:443 weight 1 maxconn 65536 check inter 30s
+backend upstream-default-backend
+    mode http
+    balance roundrobin
+    server 10.244.4.214:8080 10.244.4.214:8080 weight 1 check inter 30s
+    server 10.244.7.218:8080 10.244.7.218:8080 weight 1 check inter 30s
+
+######
+###### HTTPS frontend (tcp mode)
+######
+frontend httpsfront
+    bind *:443
+    mode tcp
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    use_backend default-cpronginx-svc-443 if { req.ssl_sni -i meteotravel.ru }
+    default_backend httpsback-shared-backend
+
+######
+###### HTTP(S) frontend - shared http mode
+######
+backend httpsback-shared-backend
+    mode tcp
+    server shared-https-frontend unix@/var/run/haproxy-https.sock send-proxy-v2
+backend httpback-shared-backend
+    mode http
+    server shared-http-frontend unix@/var/run/haproxy-http.sock send-proxy-v2
+frontend httpfront-shared-frontend
+    bind *:80
+    bind unix@/var/run/haproxy-http.sock accept-proxy
+    bind unix@/var/run/haproxy-https.sock ssl alpn h2,http/1.1 crt /ingress-controller/ssl/shared-frontend/ accept-proxy
+    mode http
+    option httplog
+    acl from-https ssl_fc
+    acl ssl-offload ssl_fc
+    acl host-meteotravel.ru var(txn.hdr_host) -i meteotravel.ru meteotravel.ru:80 meteotravel.ru:443
+    stick-table type ip size 200k expire 5m store conn_cur,conn_rate(1s)
+    tcp-request content track-sc1 src
+    option dontlog-normal
+    http-request set-var(txn.hdr_host) req.hdr(host)
+    http-request set-var(txn.hdr_proto) hdr(x-forwarded-proto)
+    http-request set-header X-Forwarded-Proto https if from-https
+    http-request del-header X-SSL-Client-Cert  if ssl-offload
+    http-request del-header X-SSL-Client-SHA1  if ssl-offload
+    http-request del-header X-SSL-Client-DN    if ssl-offload
+    http-request del-header X-SSL-Client-CN    if ssl-offload
+    http-request set-var(txn.path) path
+    http-request del-header x-forwarded-for
+    option forwardfor
+    redirect scheme https if !from-https host-meteotravel.ru
+    default_backend httpback-default-backend
+
+######
+###### HTTP frontend - default backend
+######
+backend httpback-default-backend
+    mode http
+    server shared-http-frontend unix@/var/run/haproxy-http-default-backend.sock send-proxy-v2
+frontend httpfront-default-backend
+    bind unix@/var/run/haproxy-http-default-backend.sock accept-proxy
+    mode http
+    option httplog
+    acl from-https var(txn.hdr_proto) https
+    option dontlog-normal
+    http-request set-var(txn.hdr_host) req.hdr(host)
+    http-request set-var(txn.hdr_proto) hdr(x-forwarded-proto)
+    http-request set-header X-Forwarded-Proto https if from-https
+    http-request set-var(txn.path) path
+    http-request del-header x-forwarded-for
+    option forwardfor
+    use_backend error413 if  { var(txn.path) -m beg / } { req.body_size gt 104857600 }
+    http-response set-header Strict-Transport-Security "max-age=15768000" if from-https 
+    default_backend upstream-default-backend
+
+######
+###### Error pages
+######
+backend error413
+    mode http
+    errorfile 400 /usr/local/etc/haproxy/errors/413.http
+    http-request deny deny_status 400
+backend error495
+    mode http
+    errorfile 400 /usr/local/etc/haproxy/errors/495.http
+    http-request deny deny_status 400
+backend error496
+    mode http
+    errorfile 400 /usr/local/etc/haproxy/errors/496.http
+    http-request deny deny_status 400
+listen error503noendpoints
+    bind 127.0.0.1:8181
+    mode http
+    errorfile 503 /usr/local/etc/haproxy/errors/503noendpoints.http
+
+######
+###### Stats page
+######
+listen stats
+    bind *:1936
+    mode http
+    stats enable
+    stats realm HAProxy\ Statistics
+    stats uri /
+    no log
+    option forceclose
+    stats show-legends
+
+######
+###### Monitor URI
+######
+frontend healthz
+    bind *:10253
+    mode http
+    monitor-uri /healthz
+    no log
